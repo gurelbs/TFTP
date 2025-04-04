@@ -19,6 +19,7 @@
  #define OP_DATA  3  // Data packet
  #define OP_ACK   4  // Acknowledgment
  #define OP_ERROR 5  // Error
+ #define OP_DELETE 6  // Custom opcode for delete operation
  
  /* Error Codes */
  #define ERR_NOT_DEFINED     0
