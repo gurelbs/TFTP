@@ -1,4 +1,4 @@
-# Minimal UDP File Transfer System - Phase 1
+# Minimal UDP File Transfer System
 
 A simple UDP-based file transfer system that allows uploading and downloading files between a client and server.
 
@@ -48,13 +48,3 @@ To download a file:
 - Files are broken into 512-byte blocks for transmission
 - Each data block is acknowledged by the receiver
 - Basic TFTP-like protocol with simplified operations
-
-## Phase 1 Limitations
-
-- No timeout management
-- No retransmission on packet loss
-- No security features
-- No file integrity verification
-- Limited error handling
-
-These features will be added in future phases of development.
