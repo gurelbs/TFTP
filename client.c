@@ -226,37 +226,37 @@
          fclose(file);
          
      } else if (strcmp(command, "delete") == 0 && filename) {
-            // Delete file
-            request_packet req;
-            req.opcode = htons(OP_WRQ);
-            strncpy(req.filename, filename, MAX_FILENAME_LEN);
-            strcpy(req.mode, "octet");
-            
-            sendto(client_socket, &req, sizeof(req), 0,
-                    (struct sockaddr*)&server_addr, addr_len);
-                    
-            printf("Sent delete request for %s\n", filename);
-            
-            // Wait for acknowledgment
-            int received = recvfrom(client_socket, buffer, sizeof(buffer), 0,
-                        (struct sockaddr*)&server_addr, &addr_len);
-                        
-            if (received < 0) {
-                perror("Failed to receive response");
-                close(client_socket);
-                exit(EXIT_FAILURE);
-            }
-            
-            // Check if error response
-            uint16_t opcode = ntohs(*(uint16_t*)buffer);
-            if (opcode == OP_ERROR) {
-                error_packet *error = (error_packet*)buffer;
-                printf("Error: %s\n", error->error_msg);
-                close(client_socket);
-                exit(EXIT_FAILURE);
-            }
-            
-            printf("Delete request acknowledged\n");
+         // Delete file
+         request_packet req;
+         req.opcode = htons(OP_DELETE);  // Use delete opcode instead of WRQ
+         strncpy(req.filename, filename, MAX_FILENAME_LEN);
+         strcpy(req.mode, "octet");
+         
+         sendto(client_socket, &req, sizeof(req), 0,
+                (struct sockaddr*)&server_addr, addr_len);
+                
+         printf("Sent delete request for %s\n", filename);
+         
+         // Wait for acknowledgment
+         int received = recvfrom(client_socket, buffer, sizeof(buffer), 0,
+                     (struct sockaddr*)&server_addr, &addr_len);
+                     
+         if (received < 0) {
+             perror("Failed to receive response");
+             close(client_socket);
+             exit(EXIT_FAILURE);
+         }
+         
+         // Check if error response
+         uint16_t opcode = ntohs(*(uint16_t*)buffer);
+         if (opcode == OP_ERROR) {
+             error_packet *error = (error_packet*)buffer;
+             printf("Error: %s\n", error->error_msg);
+             close(client_socket);
+             exit(EXIT_FAILURE);
+         }
+         
+         printf("Delete request acknowledged\n");
      } else {
          display_usage();
      }
