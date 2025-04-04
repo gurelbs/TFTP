@@ -12,6 +12,17 @@
  #include <errno.h>
  #include "udp_file_transfer.h"
 
+
+ // Function to send an error packet
+void send_error(int socket, struct sockaddr_in *client_addr, socklen_t addr_len, uint16_t error_code, const char *error_message) {
+    error_packet error;
+    error.opcode = htons(OP_ERROR);
+    error.error_code = htons(error_code);
+    strncpy(error.error_msg, error_message, sizeof(error.error_msg) - 1);
+    error.error_msg[sizeof(error.error_msg) - 1] = '\0'; // Ensure null termination
+    sendto(socket, &error, sizeof(error), 0, (struct sockaddr*)client_addr, addr_len);
+}
+
 // Function to ensure backup directory exists
 void ensure_backup_dir(const char* backup_dir) {
     struct stat st = {0};
@@ -249,9 +260,40 @@ int main(int argc, char *argv[]) {
             }
             
             fclose(file);
+        } else if (opcode == OP_DELETE) {
+            request_packet* req = (request_packet*)buffer;
+            printf("Received delete request for file: %s\n", req->filename);
+            
+            // Construct the full path
+            char filepath[512];
+            sprintf(filepath, "backup/%s", req->filename);
+            
+            // Delete the file
+            if (remove(filepath) == 0) {
+                printf("File deleted successfully: %s\n", filepath);
+                
+                // Send acknowledgment
+                ack_packet ack;
+                ack.opcode = htons(OP_ACK);
+                ack.block_number = htons(0);  // Block 0 for delete ack
+                
+                sendto(server_socket, &ack, sizeof(ack), 0,
+                       (struct sockaddr*)&client_addr, addr_len);
+            } else {
+                printf("Error deleting file: %s\n", strerror(errno));
+                
+                // Send error response
+                send_error(server_socket, &client_addr, addr_len, 
+                          2, "Could not delete file");
+            }
+        } else {
+            printf("Unknown opcode: %d\n", opcode);
+            
+            // Send error: unknown opcode
+            send_error(server_socket, &client_addr, addr_len, 
+                      ERR_NOT_DEFINED, "Unknown opcode");
         }
     }
-    
     close(server_socket);
     return 0;
 }
