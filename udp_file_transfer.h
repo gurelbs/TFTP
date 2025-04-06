@@ -13,6 +13,11 @@
  #define DATA_BLOCK_SIZE 512
  #define DEFAULT_PORT 6969
  
+ /* Retransmission parameters */
+ #define MAX_RETRIES 5       // Maximum number of retransmission attempts
+ #define ACK_TIMEOUT_SEC 3   // Timeout in seconds for acknowledgment
+ #define ACK_TIMEOUT_USEC 0  // Microseconds part of timeout
+ 
  /* Operation Codes */
  #define OP_RRQ   1  // Read request
  #define OP_WRQ   2  // Write request
@@ -26,6 +31,7 @@
  #define ERR_FILE_NOT_FOUND  1
  #define ERR_ACCESS_DENIED   2
  #define ERR_DISK_FULL       3
+ #define ERR_TRANSMISSION    4  // Added for transmission errors
  
  /* Packet Structures */
  
