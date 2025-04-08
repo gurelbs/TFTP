@@ -5,8 +5,7 @@ A simple UDP-based file transfer system that allows uploading and downloading fi
 ## Features
 
 - UDP-based file transfer
-- Support for uploading files (upload)
-- Support for downloading files (download)
+- Support for uploading / downloading / deleting files
 - Basic error handling
 
 ## Building
@@ -29,18 +28,33 @@ This will create two executable files:
 ./server [port]
 ```
 
-If no port is specified, the default port (6969) will be used.
-
 ### Using the Client
 
 To upload a file:
 ```bash
 ./client [server_ip] [port] upload [filename]
 ```
+for example:
+```bash
+./client 127.0.0.1 6969 upload readme.md
+```
 
 To download a file:
 ```bash
 ./client [server_ip] [port] download [filename]
+```
+for example:
+```bash
+./client 127.0.0.1 6969 download readme.md
+```
+
+To delete a file:
+```bash
+./client [server_ip] [port] delete [filename]
+```
+for example:
+```bash
+./client 127.0.0.1 6969 delete readme.md
 ```
 
 ## Implementation Details
