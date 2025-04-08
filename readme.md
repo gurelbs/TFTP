@@ -30,29 +30,17 @@ This will create two executable files:
 
 ### Using the Client
 
-To upload a file:
 ```bash
-./client [server_ip] [port] upload [filename]
+./client [server_ip] [port] <upload|download|delete> [filename]
 ```
 for example:
+
 ```bash
 ./client 127.0.0.1 6969 upload readme.md
 ```
-
-To download a file:
-```bash
-./client [server_ip] [port] download [filename]
-```
-for example:
 ```bash
 ./client 127.0.0.1 6969 download readme.md
 ```
-
-To delete a file:
-```bash
-./client [server_ip] [port] delete [filename]
-```
-for example:
 ```bash
 ./client 127.0.0.1 6969 delete readme.md
 ```
