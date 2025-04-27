@@ -1,26 +1,107 @@
 /**
  * Minimal UDP File Transfer System - Server Implementation
+ * Enhanced with AES encryption and MD5 integrity checking
  */
 
- #include <stdio.h>
- #include <stdlib.h>
- #include <string.h>
- #include <unistd.h>
- #include <arpa/inet.h>
- #include <sys/socket.h>
- #include <sys/stat.h>
- #include <errno.h>
- #include "udp_file_transfer.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <errno.h>
 
+// OpenSSL libraries for encryption and hashing
+#include <openssl/aes.h>
+#include <openssl/md5.h>
 
- // Function to send an error packet
-void send_error(int socket, struct sockaddr_in *client_addr, socklen_t addr_len, uint16_t error_code, const char *error_message) {
+#include "udp_file_transfer.h"
+
+// Hardcoded AES key for demonstration (in real app, use secure key exchange)
+unsigned char aes_key[AES_KEY_SIZE] = "TFTPSecretKey123";
+AES_KEY enc_key, dec_key;
+
+// Function to send an error packet
+void send_error(int socket, struct sockaddr_in *client_addr, socklen_t addr_len, 
+                uint16_t error_code, const char *error_message) {
     error_packet error;
     error.opcode = htons(OP_ERROR);
     error.error_code = htons(error_code);
     strncpy(error.error_msg, error_message, sizeof(error.error_msg) - 1);
     error.error_msg[sizeof(error.error_msg) - 1] = '\0'; // Ensure null termination
     sendto(socket, &error, sizeof(error), 0, (struct sockaddr*)client_addr, addr_len);
+}
+
+// Function to calculate MD5 hash of a file
+void calculate_md5(FILE *file, unsigned char *digest) {
+    MD5_CTX md5Context;
+    unsigned char buffer[1024];
+    int bytes;
+
+    // Reset file position to beginning
+    fseek(file, 0, SEEK_SET);
+
+    MD5_Init(&md5Context);
+    
+    while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0) {
+        MD5_Update(&md5Context, buffer, bytes);
+    }
+    
+    MD5_Final(digest, &md5Context);
+
+    // Reset file position to beginning
+    fseek(file, 0, SEEK_SET);
+}
+
+// Function to encrypt data
+int encrypt_data(unsigned char *plaintext, int plaintext_len, unsigned char *ciphertext) {
+    unsigned char iv[AES_BLOCK_SIZE] = {0}; // Initialization vector (all zeros for simplicity)
+    int padding = AES_BLOCK_SIZE - (plaintext_len % AES_BLOCK_SIZE);
+    int ciphertext_len = plaintext_len + padding;
+    
+    // Create a buffer that includes padding
+    unsigned char *padded_plaintext = malloc(ciphertext_len);
+    memcpy(padded_plaintext, plaintext, plaintext_len);
+    
+    // PKCS#7 padding
+    memset(padded_plaintext + plaintext_len, padding, padding);
+    
+    // Encrypt in CBC mode
+    AES_cbc_encrypt(padded_plaintext, ciphertext, ciphertext_len, &enc_key, iv, AES_ENCRYPT);
+    
+    free(padded_plaintext);
+    return ciphertext_len;
+}
+
+// Function to decrypt data
+int decrypt_data(unsigned char *ciphertext, int ciphertext_len, unsigned char *plaintext) {
+    unsigned char iv[AES_BLOCK_SIZE] = {0}; // Initialization vector (all zeros for simplicity)
+    
+    // Decrypt in CBC mode
+    AES_cbc_encrypt(ciphertext, plaintext, ciphertext_len, &dec_key, iv, AES_DECRYPT);
+    
+    // Handle PKCS#7 padding
+    int padding = plaintext[ciphertext_len - 1];
+    
+    // Verify valid padding (must be between 1 and AES_BLOCK_SIZE)
+    if (padding > 0 && padding <= AES_BLOCK_SIZE) {
+        // Check if all padding bytes are correct
+        int valid_padding = 1;
+        for (int i = ciphertext_len - padding; i < ciphertext_len; i++) {
+            if (plaintext[i] != padding) {
+                valid_padding = 0;
+                break;
+            }
+        }
+        
+        if (valid_padding) {
+            return ciphertext_len - padding;
+        }
+    }
+    
+    // If padding is invalid, return the full length
+    return ciphertext_len;
 }
 
 // Function to ensure backup directory exists
@@ -54,6 +135,10 @@ int main(int argc, char *argv[]) {
     const char* backup_dir = "backup";  // Backup directory name
     char full_path[MAX_FILENAME_LEN + 256]; // For the complete filepath
     
+    // Initialize AES encryption/decryption keys
+    AES_set_encrypt_key(aes_key, 128, &enc_key);
+    AES_set_decrypt_key(aes_key, 128, &dec_key);
+    
     // Ensure backup directory exists
     ensure_backup_dir(backup_dir);
     
@@ -82,6 +167,8 @@ int main(int argc, char *argv[]) {
     }
     
     printf("Server started on port %d\n", port);
+    printf("Using AES-128 encryption for data\n");
+    printf("File integrity checking with MD5\n");
     
     // Main server loop
     while (1) {
@@ -108,12 +195,8 @@ int main(int argc, char *argv[]) {
             FILE* file = fopen(full_path, "wb");
             if (!file) {
                 // Send error: cannot create file
-                error_packet error;
-                error.opcode = htons(OP_ERROR);
-                error.error_code = htons(ERR_ACCESS_DENIED);
-                strcpy(error.error_msg, "Cannot create file");
-                sendto(server_socket, &error, sizeof(error), 0,
-                       (struct sockaddr*)&client_addr, addr_len);
+                send_error(server_socket, &client_addr, addr_len,
+                           ERR_ACCESS_DENIED, "Cannot create file");
                 continue;
             }
             
@@ -123,6 +206,9 @@ int main(int argc, char *argv[]) {
             ack.block_number = htons(0);
             sendto(server_socket, &ack, sizeof(ack), 0,
                    (struct sockaddr*)&client_addr, addr_len);
+            
+            // Buffers for decryption
+            unsigned char decrypted_data[DATA_BLOCK_SIZE + AES_BLOCK_SIZE];
             
             // Receive data blocks
             uint16_t expected_block = 1;
@@ -135,61 +221,139 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 
-                data_packet* data = (data_packet*)buffer;
-                if (ntohs(data->opcode) != OP_DATA) {
-                    break;  // Not a data packet
-                }
+                // Check opcode
+                opcode = ntohs(*(uint16_t*)buffer);
                 
-                uint16_t block = ntohs(data->block_number);
-                printf("Received block #%d\n", block);
-                
-                if (block == expected_block) {
-                    // Write data to file
-                    int data_size = received_bytes - 4;  // Subtract header size
-                    fwrite(data->data, 1, data_size, file);
+                if (opcode == OP_DATA) {
+                    data_packet* data = (data_packet*)buffer;
+                    uint16_t block = ntohs(data->block_number);
+                    printf("Received block #%d\n", block);
                     
-                    // Send ACK
-                    ack.opcode = htons(OP_ACK);
-                    ack.block_number = htons(block);
-                    sendto(server_socket, &ack, sizeof(ack), 0,
-                           (struct sockaddr*)&client_addr, addr_len);
+                    if (block == expected_block) {
+                        // Get encrypted data size and decrypt
+                        int encrypted_size = received_bytes - 4;  // Subtract header size
+                        int decrypted_size = decrypt_data((unsigned char*)data->data, encrypted_size, decrypted_data);
+
+                        // Write decrypted data to file
+                        size_t bytes_written = fwrite(decrypted_data, 1, decrypted_size, file);
+                        if (bytes_written != (size_t)decrypted_size) {
+                            perror("Error writing to file");
+                            send_error(server_socket, &client_addr, addr_len,
+                                      ERR_DISK_FULL, "Failed to write to file");
+                            fclose(file);
+                            remove(full_path);
+                            break;
+                        }
+                        
+                        // Make sure to flush the data to disk
+                        fflush(file);
+                        
+                        // Send ACK
+                        ack.opcode = htons(OP_ACK);
+                        ack.block_number = htons(block);
+                        sendto(server_socket, &ack, sizeof(ack), 0,
+                               (struct sockaddr*)&client_addr, addr_len);
+                        
+                        printf("Decrypted block #%d, size: %d\n", block, decrypted_size);
+                        expected_block++;
+                        
+                        // Check if this was the last block (encrypted size might be padded)
+                        if (encrypted_size < DATA_BLOCK_SIZE) {
+                            printf("Last data block received\n");
+                            // We'll wait for the verification packet
+                        }
+                    } else if (block > expected_block) {
+                        // Duplicate block, send ACK for expected block
+                        ack.opcode = htons(OP_ACK);
+                        ack.block_number = htons(expected_block - 1);
+                        sendto(server_socket, &ack, sizeof(ack), 0,
+                               (struct sockaddr*)&client_addr, addr_len);
+                        printf("Duplicate block received, sent ACK for block #%d\n", expected_block - 1);
+                    } else {
+                        // Out of order block, ignore it
+                        printf("Out of order block received, expected block #%d\n", expected_block);
+                    }
+                } else if (opcode == OP_VERIFY) {
+                    // Process verification packet
+                    verify_packet* verify = (verify_packet*)buffer;
                     
-                    expected_block++;
+                    // Get the client's MD5 hash
+                    unsigned char client_md5[MD5_DIGEST_LENGTH];
+                    memcpy(client_md5, verify->md5_hash, MD5_DIGEST_LENGTH);
                     
-                    // Check if this was the last block
-                    if (data_size < DATA_BLOCK_SIZE) {
-                           printf("Received last block #%d\n", block);
-                           
-                           // Close file
-                           fclose(file);
-                           
-                           // Send final ACK
-                           ack.opcode = htons(OP_ACK);
-                           ack.block_number = htons(block);  // Should be the same as received block
-                           sendto(server_socket, &ack, sizeof(ack), 0,
-                                   (struct sockaddr*)&client_addr, addr_len);
-                           printf("Download complete\n");
+                    printf("Received MD5 hash: ");
+                    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+                        printf("%02x", client_md5[i]);
+                    }
+                    printf("\n");
+                    
+                    // Make sure file is flushed to disk before calculating MD5
+                    fflush(file);
+                    
+                    // Calculate our own MD5 hash of the downloaded file
+                    unsigned char calculated_md5[MD5_DIGEST_LENGTH];
+                    
+                    // Reopen the file to ensure all data is properly read
+                    // This forces any cached writes to be committed to disk
+                    fclose(file);
+                    file = fopen(full_path, "rb");
+                    if (!file) {
+                        send_error(server_socket, &client_addr, addr_len,
+                                  ERR_ACCESS_DENIED, "Cannot reopen file for verification");
+                        remove(full_path);
+                        printf("Error reopening file for verification\n");
                         break;
                     }
-                   } else if (block > expected_block) {
-                       // Duplicate block, send ACK for expected block
-                       ack.opcode = htons(OP_ACK);
-                       ack.block_number = htons(expected_block - 1);
-                       sendto(server_socket, &ack, sizeof(ack), 0,
+                    
+                    calculate_md5(file, calculated_md5);
+                    
+                    printf("Calculated MD5 hash: ");
+                    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+                        printf("%02x", calculated_md5[i]);
+                    }
+                    printf("\n");
+                    
+                    // Compare MD5 hashes
+                    int match = 1;
+                    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+                        if (client_md5[i] != calculated_md5[i]) {
+                            match = 0;
+                            break;
+                        }
+                    }
+                    
+                    if (match) {
+                        printf("File integrity verified (MD5 hash matched)\n");
+                        // Send ACK for verification
+                        ack.opcode = htons(OP_ACK);
+                        ack.block_number = htons(0); // Special block for verification
+                        sendto(server_socket, &ack, sizeof(ack), 0,
                                (struct sockaddr*)&client_addr, addr_len);
-                       printf("Duplicate block received, sent ACK for block #%d\n", expected_block - 1);
-                   } else {
-                       // Out of order block, ignore it
-                       printf("Out of order block received, expected block #%d\n", expected_block);
-                   }
-
-                   // Check for error response
-                   uint16_t opcode = ntohs(*(uint16_t*)buffer);
-                   if (opcode == OP_ERROR) {
-                       error_packet *error = (error_packet*)buffer;
-                       printf("Error: %s\n", error->error_msg);
-                       fclose(file);
-                       break;
+                    } else {
+                        printf("File integrity verification FAILED!\n");
+                        // Send error
+                        send_error(server_socket, &client_addr, addr_len,
+                                  ERR_VERIFICATION, "MD5 hash mismatch - file corrupted");
+                        
+                        // Delete the corrupted file
+                        fclose(file);
+                        remove(full_path);
+                        printf("Corrupted file deleted\n");
+                        break;
+                    }
+                    
+                    // Close file - upload complete with verification
+                    fclose(file);
+                    printf("Upload complete and verified\n");
+                    break;
+                } else if (opcode == OP_ERROR) {
+                    error_packet *error = (error_packet*)buffer;
+                    printf("Error from client: %s\n", error->error_msg);
+                    fclose(file);
+                    break;
+                } else {
+                    printf("Unexpected packet type: %d\n", opcode);
+                    break;
                 }
             }
             
@@ -205,14 +369,24 @@ int main(int argc, char *argv[]) {
             FILE* file = fopen(full_path, "rb");
             if (!file) {
                 // Send error: file not found
-                error_packet error;
-                error.opcode = htons(OP_ERROR);
-                error.error_code = htons(ERR_FILE_NOT_FOUND);
-                strcpy(error.error_msg, "File not found");
-                sendto(server_socket, &error, sizeof(error), 0,
-                       (struct sockaddr*)&client_addr, addr_len);
+                send_error(server_socket, &client_addr, addr_len,
+                          ERR_FILE_NOT_FOUND, "File not found");
                 continue;
             }
+            
+            // Calculate MD5 hash for verification
+            unsigned char md5_digest[MD5_DIGEST_LENGTH];
+            calculate_md5(file, md5_digest);
+            
+            printf("File MD5: ");
+            for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+                printf("%02x", md5_digest[i]);
+            }
+            printf("\n");
+            
+            // Buffers for encryption
+            unsigned char plaintext[DATA_BLOCK_SIZE];
+            // unsigned char ciphertext[DATA_BLOCK_SIZE + AES_BLOCK_SIZE]; // Allow for padding
             
             // Send file in blocks
             uint16_t block_number = 1;
@@ -223,17 +397,22 @@ int main(int argc, char *argv[]) {
                 data.opcode = htons(OP_DATA);
                 data.block_number = htons(block_number);
                 
-                bytes_read = fread(data.data, 1, DATA_BLOCK_SIZE, file);
+                // Read original data
+                bytes_read = fread(plaintext, 1, DATA_BLOCK_SIZE, file);
                 if (bytes_read < 0) {
                     perror("File read error");
                     break;
                 }
                 
-                // Send data packet
-                sendto(server_socket, &data, 4 + bytes_read, 0,  // 4 bytes header + data
+                // Encrypt the data
+                int encrypted_size = encrypt_data(plaintext, bytes_read, (unsigned char*)data.data);
+                
+                // Send encrypted data packet
+                sendto(server_socket, &data, 4 + encrypted_size, 0,  // 4 bytes header + encrypted data
                        (struct sockaddr*)&client_addr, addr_len);
                        
-                printf("Sent block #%d, size: %d\n", block_number, bytes_read);
+                printf("Sent block #%d, size: %d (encrypted: %d)\n", 
+                       block_number, bytes_read, encrypted_size);
                 
                 // Wait for ACK
                 received_bytes = recvfrom(server_socket, buffer, sizeof(buffer), 0,
@@ -254,6 +433,29 @@ int main(int argc, char *argv[]) {
                 
                 // Check if this was the last block
                 if (bytes_read < DATA_BLOCK_SIZE) {
+                    // Send verification packet with MD5 hash
+                    verify_packet verify;
+                    verify.opcode = htons(OP_VERIFY);
+                    memcpy(verify.md5_hash, md5_digest, MD5_DIGEST_LENGTH);
+                    
+                    printf("Sending MD5 verification...\n");
+                    sendto(server_socket, &verify, sizeof(verify), 0,
+                           (struct sockaddr*)&client_addr, addr_len);
+                           
+                    // Wait for verification acknowledgment
+                    received_bytes = recvfrom(server_socket, buffer, sizeof(buffer), 0,
+                                    (struct sockaddr*)&client_addr, &addr_len);
+                                    
+                    if (received_bytes > 0) {
+                        opcode = ntohs(*(uint16_t*)buffer);
+                        if (opcode == OP_ACK) {
+                            printf("Client verified file integrity\n");
+                        } else if (opcode == OP_ERROR) {
+                            error_packet* error = (error_packet*)buffer;
+                            printf("Client reported verification error: %s\n", error->error_msg);
+                        }
+                    }
+                    
                     printf("Download complete\n");
                     break;
                 }
@@ -264,13 +466,12 @@ int main(int argc, char *argv[]) {
             request_packet* req = (request_packet*)buffer;
             printf("Received delete request for file: %s\n", req->filename);
             
-            // Construct the full path
-            char filepath[512];
-            sprintf(filepath, "backup/%s", req->filename);
+            // Create complete filepath in backup directory
+            create_backup_path(full_path, backup_dir, req->filename);
             
             // Delete the file
-            if (remove(filepath) == 0) {
-                printf("File deleted successfully: %s\n", filepath);
+            if (remove(full_path) == 0) {
+                printf("File deleted successfully: %s\n", full_path);
                 
                 // Send acknowledgment
                 ack_packet ack;
@@ -284,7 +485,7 @@ int main(int argc, char *argv[]) {
                 
                 // Send error response
                 send_error(server_socket, &client_addr, addr_len, 
-                          2, "Could not delete file");
+                          ERR_ACCESS_DENIED, "Could not delete file");
             }
         } else {
             printf("Unknown opcode: %d\n", opcode);
