@@ -1,5 +1,6 @@
 /**
  * Minimal UDP File Transfer System - Client Implementation
+ * Enhanced with AES encryption and MD5 integrity checking
  */
 
 #include <arpa/inet.h>
@@ -11,7 +12,16 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+// OpenSSL libraries for encryption and hashing
+#include <openssl/aes.h>
+#include <openssl/md5.h>
+#include <openssl/rand.h>
+
 #include "udp_file_transfer.h"
+
+// Hardcoded AES key for demonstration (in real app, use secure key exchange)
+unsigned char aes_key[AES_KEY_SIZE] = "TFTPSecretKey123";
+AES_KEY enc_key, dec_key;
 
 // Function to set socket timeout
 void set_socket_timeout(int socket, int seconds, int microseconds) {
@@ -25,6 +35,67 @@ void set_socket_timeout(int socket, int seconds, int microseconds) {
   }
 }
 
+// Function to calculate MD5 hash of a file
+void calculate_md5(FILE *file, unsigned char *digest) {
+  MD5_CTX md5Context;
+  unsigned char buffer[1024];
+  int bytes;
+
+  // Reset file position to beginning
+  fseek(file, 0, SEEK_SET);
+
+  MD5_Init(&md5Context);
+  
+  while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0) {
+    MD5_Update(&md5Context, buffer, bytes);
+  }
+  
+  MD5_Final(digest, &md5Context);
+
+  // Reset file position to beginning
+  fseek(file, 0, SEEK_SET);
+}
+
+// Function to encrypt data
+int encrypt_data(unsigned char *plaintext, int plaintext_len, unsigned char *ciphertext) {
+  unsigned char iv[AES_BLOCK_SIZE] = {0}; // Initialization vector (all zeros for simplicity)
+  int padding = AES_BLOCK_SIZE - (plaintext_len % AES_BLOCK_SIZE);
+  int ciphertext_len = plaintext_len + padding;
+  
+  // Create a buffer that includes padding
+  unsigned char *padded_plaintext = malloc(ciphertext_len);
+  memcpy(padded_plaintext, plaintext, plaintext_len);
+  
+  // PKCS#7 padding
+  memset(padded_plaintext + plaintext_len, padding, padding);
+  
+  // Encrypt in CBC mode
+  AES_cbc_encrypt(padded_plaintext, ciphertext, ciphertext_len, &enc_key, iv, AES_ENCRYPT);
+  
+  free(padded_plaintext);
+  return ciphertext_len;
+}
+
+// Function to decrypt data
+int decrypt_data(unsigned char *ciphertext, int ciphertext_len, unsigned char *plaintext) {
+  unsigned char iv[AES_BLOCK_SIZE] = {0}; // Initialization vector (all zeros for simplicity)
+  
+  // Decrypt in CBC mode
+  AES_cbc_encrypt(ciphertext, plaintext, ciphertext_len, &dec_key, iv, AES_DECRYPT);
+  
+  // Handle PKCS#7 padding
+  int padding = plaintext[ciphertext_len - 1];
+  
+  // Verify valid padding (must be between 1 and AES_BLOCK_SIZE)
+  if (padding > 0 && padding <= AES_BLOCK_SIZE) {
+    return ciphertext_len - padding;
+  }
+  
+  // If padding is invalid, return the full length
+  return ciphertext_len;
+}
+
+// Function to display program usage
 void display_usage() {
     printf("Usage:\n");
     printf("  ./client [server_ip] [port] <command> [filename]\n\n");
@@ -104,6 +175,10 @@ int main(int argc, char *argv[]) {
   socklen_t addr_len = sizeof(server_addr);
   char buffer[1024];
   
+  // Initialize AES encryption/decryption keys
+  AES_set_encrypt_key(aes_key, 128, &enc_key);
+  AES_set_decrypt_key(aes_key, 128, &dec_key);
+  
   // Default values
   const char *server_ip = "127.0.0.1";  // Default to localhost
   int port = DEFAULT_PORT;              // Default port from header (6969)
@@ -170,6 +245,16 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
     }
 
+    // Calculate MD5 hash for file integrity
+    unsigned char md5_digest[MD5_DIGEST_LENGTH];
+    calculate_md5(file, md5_digest);
+    
+    printf("File MD5: ");
+    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+      printf("%02x", md5_digest[i]);
+    }
+    printf("\n");
+
     // Send write request
     request_packet req;
     req.opcode = htons(OP_WRQ);
@@ -227,16 +312,18 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
     }
 
-    // Send file data
+    // Send file data with encryption
     uint16_t block_number = 1;
     int bytes_read;
+    unsigned char plaintext[DATA_BLOCK_SIZE];
+    // unsigned char ciphertext[DATA_BLOCK_SIZE + AES_BLOCK_SIZE]; // Allow for padding
 
     while (1) {
       data_packet data;
       data.opcode = htons(OP_DATA);
       data.block_number = htons(block_number);
 
-      bytes_read = fread(data.data, 1, DATA_BLOCK_SIZE, file);
+      bytes_read = fread(plaintext, 1, DATA_BLOCK_SIZE, file);
       if (bytes_read == 0) {
         if (ferror(file)) {
           perror("File read error");
@@ -248,9 +335,12 @@ int main(int argc, char *argv[]) {
         printf("End of file reached\n");
       }
 
+      // Encrypt the data before sending
+      int encrypted_size = encrypt_data(plaintext, bytes_read, (unsigned char*)data.data);
+      
       // Send data packet with retry logic
       received =
-          send_with_retry(client_socket, &data, 4 + bytes_read, &server_addr,
+          send_with_retry(client_socket, &data, 4 + encrypted_size, &server_addr,
                           addr_len, block_number, buffer, sizeof(buffer));
 
       if (received < 0) {
@@ -261,12 +351,37 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
       }
 
-      printf("Successfully sent block #%d, size: %d\n", block_number,
-             bytes_read);
+      printf("Successfully sent block #%d, size: %d (encrypted: %d)\n", 
+             block_number, bytes_read, encrypted_size);
       block_number++;
 
       // Check if this was the last block
       if (bytes_read < DATA_BLOCK_SIZE) {
+        // Send MD5 verification packet
+        verify_packet verify;
+        verify.opcode = htons(OP_VERIFY);
+        memcpy(verify.md5_hash, md5_digest, MD5_DIGEST_LENGTH);
+
+        printf("Sending MD5 verification...\n");
+        if (sendto(client_socket, &verify, sizeof(verify), 0,
+                  (struct sockaddr *)&server_addr, addr_len) < 0) {
+          perror("Failed to send verification");
+        } else {
+          // Wait for verification ACK
+          received = recvfrom(client_socket, buffer, sizeof(buffer), 0,
+                             (struct sockaddr *)&server_addr, &addr_len);
+          
+          if (received > 0) {
+            uint16_t opcode = ntohs(*(uint16_t *)buffer);
+            if (opcode == OP_ACK) {
+              printf("File integrity verified by server\n");
+            } else if (opcode == OP_ERROR) {
+              error_packet *error = (error_packet *)buffer;
+              printf("Verification failed: %s\n", error->error_msg);
+            }
+          }
+        }
+        
         printf("Upload complete\n");
         fclose(file);
         close(client_socket);
@@ -343,22 +458,81 @@ int main(int argc, char *argv[]) {
 
     // Process received data
     uint16_t expected_block = 1;
+    unsigned char decrypted_data[DATA_BLOCK_SIZE + AES_BLOCK_SIZE];
 
     do {
       if (opcode != OP_DATA) {
-        printf("Expected data packet (opcode: %d)\n", opcode);
-        break;
+        if (opcode == OP_VERIFY) {
+          // Process verification packet
+          verify_packet *verify = (verify_packet *)buffer;
+          
+          // Get the received MD5 hash
+          unsigned char received_md5[MD5_DIGEST_LENGTH];
+          memcpy(received_md5, verify->md5_hash, MD5_DIGEST_LENGTH);
+          
+          // Calculate our own MD5 hash of the downloaded file
+          unsigned char calculated_md5[MD5_DIGEST_LENGTH];
+          
+          // Rewind file to calculate MD5
+          fseek(file, 0, SEEK_SET);
+          calculate_md5(file, calculated_md5);
+          
+          // Compare MD5 hashes
+          int match = 1;
+          for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+            if (received_md5[i] != calculated_md5[i]) {
+              match = 0;
+              break;
+            }
+          }
+          
+          if (match) {
+            printf("File integrity verified (MD5 hash matched)\n");
+            // Send ACK for the verification
+            ack_packet ack;
+            ack.opcode = htons(OP_ACK);
+            ack.block_number = htons(0); // Special block number for verification
+            sendto(client_socket, &ack, sizeof(ack), 0,
+                   (struct sockaddr *)&server_addr, addr_len);
+          } else {
+            printf("WARNING: File integrity verification failed!\n");
+            printf("Received MD5: ");
+            for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+              printf("%02x", received_md5[i]);
+            }
+            printf("\nCalculated MD5: ");
+            for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+              printf("%02x", calculated_md5[i]);
+            }
+            printf("\n");
+            
+            // Send error for the verification
+            error_packet error;
+            error.opcode = htons(OP_ERROR);
+            error.error_code = htons(ERR_VERIFICATION);
+            strcpy(error.error_msg, "MD5 verification failed");
+            sendto(client_socket, &error, sizeof(error), 0,
+                   (struct sockaddr *)&server_addr, addr_len);
+          }
+          break;
+        } else {
+          printf("Expected data packet (opcode: %d)\n", opcode);
+          break;
+        }
       }
 
       data_packet *data = (data_packet *)buffer;
       uint16_t block = ntohs(data->block_number);
 
       if (block == expected_block) {
-        // Write data to file
+        // Get data size and decrypt the data
         int data_size = received - 4;  // Subtract header size
-        fwrite(data->data, 1, data_size, file);
+        int decrypted_size = decrypt_data((unsigned char*)data->data, data_size, decrypted_data);
+        
+        // Write decrypted data to file
+        fwrite(decrypted_data, 1, decrypted_size, file);
 
-        // Send ACK with retry logic (ACK doesn't need response verification)
+        // Send ACK
         ack_packet ack;
         ack.opcode = htons(OP_ACK);
         ack.block_number = htons(block);
@@ -374,7 +548,8 @@ int main(int argc, char *argv[]) {
           }
         }
 
-        printf("Received block #%d, size: %d\n", block, data_size);
+        printf("Received block #%d, size: %d (decrypted: %d)\n", 
+               block, data_size, decrypted_size);
 
         expected_block++;
 

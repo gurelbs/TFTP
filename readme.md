@@ -1,12 +1,22 @@
-# Minimal UDP File Transfer System
+# Secure UDP File Transfer System
 
-A simple UDP-based file transfer system that allows uploading and downloading files between a client and server.
+A secure UDP-based file transfer system that allows uploading and downloading files between a client and server with encryption and integrity verification.
 
-## Features
+## Security Features
+
+- **AES-128 Encryption**: All file data is encrypted using AES-128 to ensure secure communication
+- **MD5 Integrity Checking**: Files are verified using MD5 hash to ensure they are transferred correctly
+
+## Additional Features
 
 - UDP-based file transfer
 - Support for uploading / downloading / deleting files
-- Basic error handling
+- Robust error handling and retry mechanisms
+- Verification of file integrity
+
+## Dependencies
+
+- OpenSSL for encryption and hashing
 
 ## Building
 
@@ -36,13 +46,13 @@ This will create two executable files:
 for example:
 
 ```bash
-./client 127.0.0.1 6969 upload readme.md
+./client 127.0.0.1 69 upload readme.md
 ```
 ```bash
-./client 127.0.0.1 6969 download readme.md
+./client 127.0.0.1 69 download readme.md
 ```
 ```bash
-./client 127.0.0.1 6969 delete readme.md
+./client 127.0.0.1 69 delete readme.md
 ```
 
 ## Implementation Details
@@ -50,3 +60,5 @@ for example:
 - Files are broken into 512-byte blocks for transmission
 - Each data block is acknowledged by the receiver
 - Basic TFTP-like protocol with simplified operations
+- File data is encrypted using AES-128
+- MD5 hash is used for integrity verification
