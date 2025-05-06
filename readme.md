@@ -34,6 +34,13 @@ This will create two executable files:
 
 ### Starting the Server
 
+#### use sudo for port 69
+
+```bash
+sudo ./server
+```
+OR 
+
 ```bash
 ./server [port]
 ```
