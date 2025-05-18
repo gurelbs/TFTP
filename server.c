@@ -16,6 +16,21 @@
 #include "common.h"
 #include "server_operations.h"
 
+// Function to handle file integrity verification using MD5
+int verify_file_integrity(const char *filename, unsigned char *expected_md5) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror("Failed to open file for MD5 verification");
+        return 0;
+    }
+
+    unsigned char actual_md5[MD5_DIGEST_LENGTH];
+    calculate_md5(file, actual_md5);
+    fclose(file);
+
+    return memcmp(expected_md5, actual_md5, MD5_DIGEST_LENGTH) == 0;
+}
+
 int main(int argc, char *argv[]) {
     int server_socket;
     struct sockaddr_in server_addr, client_addr;

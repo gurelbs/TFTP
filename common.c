@@ -34,6 +34,11 @@ void calculate_md5(FILE *file, unsigned char *digest) {
     fseek(file, 0, SEEK_SET);
 }
 
+// Function to compare two MD5 hashes
+int compare_md5_hashes(unsigned char *hash1, unsigned char *hash2) {
+    return memcmp(hash1, hash2, MD5_DIGEST_LENGTH) == 0;
+}
+
 // Function to encrypt data
 int encrypt_data(unsigned char *plaintext, int plaintext_len, unsigned char *ciphertext) {
     unsigned char iv[AES_BLOCK_SIZE] = {0}; // Initialization vector (all zeros for simplicity)
