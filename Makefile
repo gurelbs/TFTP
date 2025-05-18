@@ -12,4 +12,3 @@ client: client.c common.c udp_file_transfer.h
 
 clean:
 	rm -f server client
-

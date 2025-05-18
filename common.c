@@ -82,3 +82,25 @@ void init_aes_keys() {
     AES_set_encrypt_key(aes_key, 128, &enc_key);
     AES_set_decrypt_key(aes_key, 128, &dec_key);
 }
+
+// Function to initialize the backup directory
+void init_backup_dir(const char* backup_dir) {
+    struct stat st = {0};
+    
+    // Check if directory exists
+    if (stat(backup_dir, &st) == -1) {
+        // Create directory with rwxr-xr-x permissions (755)
+        if (mkdir(backup_dir, 0755) == -1) {
+            perror("Failed to create backup directory");
+            exit(EXIT_FAILURE);
+        }
+        printf("Created backup directory: %s\n", backup_dir);
+    }
+}
+
+// Function to create the backup path
+void create_backup_path(char* full_path, const char* backup_dir, const char* filename) {
+    strcpy(full_path, backup_dir);
+    strcat(full_path, "/");
+    strcat(full_path, filename);
+}
