@@ -3,6 +3,11 @@
 #include <string.h>
 #include <openssl/aes.h>
 #include <openssl/md5.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 #include "udp_file_transfer.h"
 #include "common.h"
 
@@ -81,4 +86,26 @@ int decrypt_data(unsigned char *ciphertext, int ciphertext_len, unsigned char *p
 void init_aes_keys() {
     AES_set_encrypt_key(aes_key, 128, &enc_key);
     AES_set_decrypt_key(aes_key, 128, &dec_key);
+}
+
+// Function to set socket timeout
+void set_socket_timeout(int socket, int sec, int usec) {
+    struct timeval timeout;
+    timeout.tv_sec = sec;
+    timeout.tv_usec = usec;
+    if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Set socket timeout failed");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Function to ensure backup directory exists
+void ensure_backup_dir(const char *backup_dir) {
+    struct stat st = {0};
+    if (stat(backup_dir, &st) == -1) {
+        if (mkdir(backup_dir, 0700) < 0) {
+            perror("Failed to create backup directory");
+            exit(EXIT_FAILURE);
+        }
+    }
 }
