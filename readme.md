@@ -89,3 +89,24 @@ Using default settings (localhost:69):
 - This implementation uses static encryption mechanisms for demonstration
 - For production use, consider implementing stronger authentication and key exchange
 - MD5 is used for simplicity but has known vulnerabilities
+
+## New Module Structure
+
+The codebase has been refactored to separate client and server code into distinct modules for better organization. Common functionality, such as encryption and MD5 calculation, remains abstracted into `common.c` and `common.h`.
+
+### New Files
+
+- `client_operations.c` and `client_operations.h`: Contains client-specific functionality.
+- `server_operations.c` and `server_operations.h`: Contains server-specific functionality.
+
+### Updated Makefile
+
+The `Makefile` has been updated to support the new module structure and includes more granular build targets and dependencies.
+
+### Configuration
+
+Hardcoded values and constants have been refactored into configuration files or environment variables for better flexibility.
+
+### Error Handling and Logging
+
+Error handling and logging have been improved for better debugging and user feedback.
