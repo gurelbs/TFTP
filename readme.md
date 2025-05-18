@@ -2,12 +2,22 @@
 
 A secure UDP-based file transfer system that allows uploading and downloading files between a client and server with encryption and integrity verification.
 
-## Security Features
+## Table of Contents
+
+- [Features](#features)
+- [Dependencies](#dependencies)
+- [Building](#building)
+- [Usage](#usage)
+- [Implementation Details](#implementation-details)
+
+## Features
+
+### Security Features
 
 - **AES-128 Encryption**: All file data is encrypted using AES-128 to ensure secure communication
 - **MD5 Integrity Checking**: Files are verified using MD5 hash to ensure they are transferred correctly
 
-## Additional Features
+### Additional Features
 
 - UDP-based file transfer
 - Support for uploading / downloading / deleting files
@@ -34,32 +44,36 @@ This will create two executable files:
 
 ### Starting the Server
 
-#### use sudo for port 69
-
 ```bash
-sudo ./server
+sudo ./server    # Use sudo for default port 69
 ```
+
 OR 
 
 ```bash
-./server [port]
+./server [port]  # Specify custom port
 ```
+
+Note: Using port numbers below 1024 (like the default 69) requires root privileges.
 
 ### Using the Client
 
+General syntax:
 ```bash
 ./client [server_ip] [port] <upload|download|delete> [filename]
 ```
-for example:
+
+Examples:
 
 ```bash
 ./client 127.0.0.1 69 upload readme.md
-```
-```bash
 ./client 127.0.0.1 69 download readme.md
-```
-```bash
 ./client 127.0.0.1 69 delete readme.md
+```
+
+Using default settings (localhost:69):
+```bash
+./client upload example.txt
 ```
 
 ## Implementation Details
@@ -69,3 +83,9 @@ for example:
 - Basic TFTP-like protocol with simplified operations
 - File data is encrypted using AES-128
 - MD5 hash is used for integrity verification
+
+## Security Considerations
+
+- This implementation uses static encryption mechanisms for demonstration
+- For production use, consider implementing stronger authentication and key exchange
+- MD5 is used for simplicity but has known vulnerabilities
