@@ -11,414 +11,447 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <errno.h>
-
-// OpenSSL libraries for encryption and hashing
-#include <openssl/aes.h>
-#include <openssl/md5.h>
-
+#include <sys/select.h>
+#include <time.h>
+#include <stdarg.h>
+#include <sys/types.h>
 #include "udp_file_transfer.h"
-#include "common.h"
 
-// Function to send an error packet
-void send_error(int socket, struct sockaddr_in *client_addr, socklen_t addr_len, uint16_t error_code, const char *error_message) {
-    error_packet error;
-    error.opcode = htons(OP_ERROR);
-    error.error_code = htons(error_code);
-    strncpy(error.error_msg, error_message, sizeof(error.error_msg) - 1);
-    error.error_msg[sizeof(error.error_msg) - 1] = '\0'; // Ensure null termination
-    sendto(socket, &error, sizeof(error), 0, (struct sockaddr*)client_addr, addr_len);
+#define BUFFER_SIZE 512
+#define MAX_CLIENTS 10
+#define LOG_FILE "server.log"
+#define BACKUP_DIR "backup"
+#define TIMEOUT_SECS 5
+
+FILE *log_file = NULL;
+
+// Helper function to log messages to file and console
+void log_message(const char *format, ...) {
+    if (!log_file) {
+        log_file = fopen(LOG_FILE, "a");
+        if (!log_file) {
+            perror("Could not open log file");
+            return;
+        }
+    }
+    
+    va_list args;
+    va_start(args, format);
+    
+    time_t now = time(NULL);
+    char time_str[26];
+    ctime_r(&now, time_str);
+    time_str[24] = '\0'; // Remove newline
+    
+    fprintf(log_file, "[%s] ", time_str);
+    vfprintf(log_file, format, args);
+    fprintf(log_file, "\n");
+    fflush(log_file);
+    
+    va_end(args);
+    
+    // Also print to console
+    va_start(args, format);
+    printf("[%s] ", time_str);
+    vprintf(format, args);
+    printf("\n");
+    va_end(args);
 }
 
-
-// Function to ensure backup directory exists
-void ensure_backup_dir(const char* backup_dir) {
+// Create backup directory if it doesn't exist
+void ensure_backup_dir() {
     struct stat st = {0};
-    
-    // Check if directory exists
-    if (stat(backup_dir, &st) == -1) {
-        // Create directory with rwxr-xr-x permissions (755)
-        if (mkdir(backup_dir, 0755) == -1) {
-            perror("Failed to create backup directory");
+    if (stat(BACKUP_DIR, &st) == -1) {
+        if (mkdir(BACKUP_DIR, 0755) == -1) {
+            fprintf(stderr, "Error creating backup directory: %s\n", strerror(errno));
             exit(EXIT_FAILURE);
         }
-        printf("Created backup directory: %s\n", backup_dir);
+        log_message("Created backup directory: %s", BACKUP_DIR);
+    } else {
+        log_message("Using existing backup directory: %s", BACKUP_DIR);
     }
 }
 
-// Function to create complete filepath in the backup directory
-void create_backup_path(char* full_path, const char* backup_dir, const char* filename) {
-    strcpy(full_path, backup_dir);
-    strcat(full_path, "/");
-    strcat(full_path, filename);
-}
- 
-int main(int argc, char *argv[]) {
-    int server_socket;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-    char buffer[1024];
-    int port = DEFAULT_PORT;
-    const char* backup_dir = "backup";  // Backup directory name
-    char full_path[MAX_FILENAME_LEN + 256]; // For the complete filepath
-    
-    init_aes_keys();
-    
-    // Ensure backup directory exists
-    ensure_backup_dir(backup_dir);
-    
-    // Parse command line arguments for port
-    if (argc > 1) {
-        port = atoi(argv[1]);
+// Get full path for a file in the backup directory
+char* get_backup_path(const char* filename) {
+    // Extract just the basename from the path
+    const char* basename = strrchr(filename, '/');
+    if (basename) {
+        basename++; // Skip the '/'
+    } else {
+        basename = filename;
     }
     
-    // Create UDP socket
-    if ((server_socket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("Socket creation failed");
+    char* path = malloc(strlen(BACKUP_DIR) + strlen(basename) + 2); // +2 for '/' and null terminator
+    if (!path) {
+        log_message("Memory allocation failed");
+        return NULL;
+    }
+    
+    sprintf(path, "%s/%s", BACKUP_DIR, basename);
+    return path;
+}
+
+// Send error packet to client
+void send_error(int sockfd, struct sockaddr_in *client_addr, socklen_t addr_len, 
+                const char *error_message) {
+    struct {
+        uint16_t opcode;
+        uint16_t packet_number;
+        char data[BUFFER_SIZE];
+    } pkt;
+    
+    pkt.opcode = OP_ERROR;
+    pkt.packet_number = 0;
+    strncpy(pkt.data, error_message, BUFFER_SIZE - 1);
+    pkt.data[BUFFER_SIZE - 1] = '\0';
+    
+    sendto(sockfd, &pkt, sizeof(uint16_t) + sizeof(uint16_t) + strlen(pkt.data) + 1, 0,
+           (struct sockaddr *)client_addr, addr_len);
+    
+    log_message("Sent error to client: %s", error_message);
+}
+
+// Handle write request (client uploading file to server)
+void handle_write_request(int sockfd, struct sockaddr_in *client_addr, socklen_t addr_len, const char *filename) {
+    log_message("Received write request for file: %s from %s:%d", 
+               filename, inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
+    
+    // Get path in backup directory
+    char* backup_path = get_backup_path(filename);
+    if (!backup_path) {
+        send_error(sockfd, client_addr, addr_len, "Internal server error");
+        return;
+    }
+    
+    // Check if destination is a directory
+    struct stat dest_stat;
+    if (stat(backup_path, &dest_stat) == 0 && S_ISDIR(dest_stat.st_mode)) {
+        log_message("Error: Cannot overwrite a directory - %s", backup_path);
+        send_error(sockfd, client_addr, addr_len, "Destination is a directory");
+        free(backup_path);
+        return;
+    }
+    
+    log_message("Saving file to: %s", backup_path);
+    
+    FILE *file = fopen(backup_path, "wb");
+    if (!file) {
+        log_message("Error: Could not open file for writing - %s: %s", backup_path, strerror(errno));
+        send_error(sockfd, client_addr, addr_len, strerror(errno));
+        free(backup_path);
+        return;
+    }
+    
+    struct {
+        uint16_t opcode;
+        uint16_t packet_number;
+        char data[BUFFER_SIZE];
+    } pkt;
+    
+    // Send ACK for the write request
+    pkt.opcode = ACK;
+    pkt.packet_number = 0;
+    sendto(sockfd, &pkt, sizeof(uint16_t) + sizeof(uint16_t), 0,
+           (struct sockaddr *)client_addr, addr_len);
+    log_message("Sent ACK for write request");
+    
+    int expected_packet = 0;
+    while (1) {
+        ssize_t bytes_received = recvfrom(sockfd, &pkt, sizeof(pkt), 0,
+                                          (struct sockaddr *)client_addr, &addr_len);
+        if (bytes_received < 0) {
+            log_message("Error receiving packet: %s", strerror(errno));
+            continue;
+        }
+        
+        log_message("Received packet #%d with opcode %d (%zd bytes)", 
+                   pkt.packet_number, pkt.opcode, bytes_received);
+        
+        if (pkt.opcode == OP_EOF) {
+            log_message("End of file reached");
+            // Send final ACK
+            pkt.opcode = ACK;
+            sendto(sockfd, &pkt, sizeof(uint16_t) + sizeof(uint16_t), 0,
+                   (struct sockaddr *)client_addr, addr_len);
+            break;
+        }
+        
+        if (pkt.opcode != OP_DATA) {
+            log_message("Error: Expected data packet, got opcode %d", pkt.opcode);
+            continue;
+        }
+        
+        if (pkt.packet_number == expected_packet) {
+            size_t data_size = bytes_received - sizeof(pkt.opcode) - sizeof(pkt.packet_number);
+            fwrite(pkt.data, 1, data_size, file);
+            expected_packet++;
+            
+            // Send ACK
+            pkt.opcode = ACK;
+            sendto(sockfd, &pkt, sizeof(uint16_t) + sizeof(uint16_t), 0,
+                   (struct sockaddr *)client_addr, addr_len);
+            log_message("Sent ACK for packet #%d", pkt.packet_number);
+        } else {
+            log_message("Received out-of-order packet #%d, expected #%d",
+                       pkt.packet_number, expected_packet);
+            // Resend ACK for the last received packet
+            pkt.opcode = ACK;
+            pkt.packet_number = expected_packet - 1;
+            sendto(sockfd, &pkt, sizeof(uint16_t) + sizeof(uint16_t), 0,
+                   (struct sockaddr *)client_addr, addr_len);
+        }
+    }
+    
+    fclose(file);
+    log_message("File transfer complete: %s", backup_path);
+    free(backup_path);
+}
+
+// Handle read request (client downloading file from server)
+void handle_read_request(int sockfd, struct sockaddr_in *client_addr, socklen_t addr_len, const char *filename) {
+    log_message("Received read request for file: %s from %s:%d", 
+               filename, inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
+    
+    // Always use backup directory
+    char* backup_path = get_backup_path(filename);
+    if (!backup_path) {
+        send_error(sockfd, client_addr, addr_len, "Internal server error");
+        return;
+    }
+    
+    log_message("Looking for file in backup directory: %s", backup_path);
+    
+    // Check if file exists and is not a directory
+    struct stat file_stat;
+    if (stat(backup_path, &file_stat) != 0) {
+        log_message("Error: File not found in backup directory - %s", backup_path);
+        send_error(sockfd, client_addr, addr_len, "File not found in backup directory");
+        free(backup_path);
+        return;
+    }
+    
+    // Check if it's a directory
+    if (S_ISDIR(file_stat.st_mode)) {
+        log_message("Error: Cannot download a directory - %s", backup_path);
+        send_error(sockfd, client_addr, addr_len, "Cannot download directories");
+        free(backup_path);
+        return;
+    }
+    
+    FILE *file = fopen(backup_path, "rb");
+    if (!file) {
+        log_message("Error: Could not open file in backup directory - %s: %s", backup_path, strerror(errno));
+        send_error(sockfd, client_addr, addr_len, strerror(errno));
+        free(backup_path);
+        return;
+    }
+    
+    struct {
+        uint16_t opcode;
+        uint16_t packet_number;
+        char data[BUFFER_SIZE];
+    } pkt;
+    
+    char buffer[BUFFER_SIZE];
+    size_t bytes_read;
+    int packet_number = 0;
+    
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        pkt.opcode = OP_DATA;
+        pkt.packet_number = packet_number++;
+        memcpy(pkt.data, buffer, bytes_read);
+        
+        log_message("Sending packet #%d (%zu bytes of data)", pkt.packet_number, bytes_read);
+        
+        // Send data packet with exact size
+        size_t packet_size = sizeof(uint16_t) + sizeof(uint16_t) + bytes_read;
+        ssize_t sent_bytes = sendto(sockfd, &pkt, packet_size, 0,
+                                    (struct sockaddr *)client_addr, addr_len);
+        
+        if (sent_bytes < 0) {
+            log_message("Error sending packet: %s", strerror(errno));
+            fclose(file);
+            free(backup_path);
+            return;
+        }
+        
+        log_message("Sent %zd bytes", sent_bytes);
+        
+        // Wait for ACK with timeout
+        fd_set readfds;
+        struct timeval tv;
+        FD_ZERO(&readfds);
+        FD_SET(sockfd, &readfds);
+        tv.tv_sec = TIMEOUT_SECS;
+        tv.tv_usec = 0;
+        
+        int select_result = select(sockfd + 1, &readfds, NULL, NULL, &tv);
+        
+        if (select_result <= 0) {
+            // Timeout or error, resend packet
+            log_message("ACK not received for packet #%d, resending", pkt.packet_number);
+            packet_number--; // Keep the same packet number
+            fseek(file, -bytes_read, SEEK_CUR); // Go back to resend the same data
+            continue;
+        }
+        
+        // Receive ACK
+        if (recvfrom(sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)client_addr, &addr_len) < 0) {
+            log_message("Error receiving ACK: %s", strerror(errno));
+            packet_number--; // Keep the same packet number
+            fseek(file, -bytes_read, SEEK_CUR); // Go back to resend the same data
+            continue;
+        }
+        
+        if (pkt.opcode == ACK) {
+            log_message("Received ACK for packet #%d", pkt.packet_number);
+        } else {
+            log_message("Error: Expected ACK, got opcode %d", pkt.opcode);
+            packet_number--; // Keep the same packet number
+            fseek(file, -bytes_read, SEEK_CUR); // Go back to resend the same data
+        }
+    }
+    
+    // Send end-of-file packet
+    pkt.opcode = OP_EOF;
+    pkt.packet_number = packet_number;
+    sendto(sockfd, &pkt, sizeof(uint16_t) + sizeof(uint16_t), 0,
+           (struct sockaddr *)client_addr, addr_len);
+    log_message("File transfer complete from backup directory: %s (%d packets)", backup_path, packet_number);
+    
+    // Wait for final ACK
+    recvfrom(sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)client_addr, &addr_len);
+    
+    fclose(file);
+    free(backup_path);
+}
+
+// Handle delete request (client requesting to delete a file)
+void handle_delete_request(int sockfd, struct sockaddr_in *client_addr, socklen_t addr_len, const char *filename) {
+    log_message("Received delete request for file: %s from %s:%d", 
+               filename, inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
+    
+    // Always use backup directory
+    char* backup_path = get_backup_path(filename);
+    if (!backup_path) {
+        send_error(sockfd, client_addr, addr_len, "Internal server error");
+        return;
+    }
+    
+    log_message("Checking if file exists in backup directory: %s", backup_path);
+    
+    struct {
+        uint16_t opcode;
+        uint16_t packet_number;
+        char data[BUFFER_SIZE];
+    } pkt;
+    
+    // Check if file exists before trying to delete it
+    struct stat file_stat;
+    if (stat(backup_path, &file_stat) != 0) {
+        log_message("Error: File not found in backup directory - %s", backup_path);
+        send_error(sockfd, client_addr, addr_len, "File not found in backup directory");
+        free(backup_path);
+        return;
+    }
+    
+    // Check if it's a directory
+    if (S_ISDIR(file_stat.st_mode)) {
+        log_message("Error: Cannot delete a directory - %s", backup_path);
+        send_error(sockfd, client_addr, addr_len, "Cannot delete directories");
+        free(backup_path);
+        return;
+    }
+    
+    if (unlink(backup_path) == 0) {
+        log_message("File deleted successfully from backup directory: %s", backup_path);
+        pkt.opcode = ACK;
+        pkt.packet_number = 0;
+        sendto(sockfd, &pkt, sizeof(uint16_t) + sizeof(uint16_t), 0,
+               (struct sockaddr *)client_addr, addr_len);
+    } else {
+        log_message("Error deleting file from backup directory %s: %s", backup_path, strerror(errno));
+        send_error(sockfd, client_addr, addr_len, strerror(errno));
+    }
+    
+    free(backup_path);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
     
-    // Configure server address
+    int port = atoi(argv[1]);
+    
+    // Initialize logging
+    log_message("Server starting on port %d", port);
+    
+    // Ensure backup directory exists
+    ensure_backup_dir();
+    
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        log_message("Error creating socket: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    
+    struct sockaddr_in server_addr, client_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(port);
     
-    // Bind socket to address
-    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(server_socket);
+    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        log_message("Error binding socket: %s", strerror(errno));
+        close(sockfd);
         exit(EXIT_FAILURE);
     }
     
-    printf("Server started on port %d\n", port);
-    printf("Using AES-128 encryption for data\n");
-    printf("File integrity checking with MD5\n");
+    log_message("Server listening on port %d", port);
     
-    // Main server loop
     while (1) {
-        int received_bytes = recvfrom(server_socket, buffer, sizeof(buffer), 0,
-                             (struct sockaddr*)&client_addr, &addr_len);
+        struct {
+            uint16_t opcode;
+            uint16_t packet_number;
+            char data[BUFFER_SIZE];
+        } pkt;
+        socklen_t addr_len = sizeof(client_addr);
         
-        if (received_bytes < 0) {
-            perror("recvfrom failed");
+        ssize_t bytes_received = recvfrom(sockfd, &pkt, sizeof(pkt), 0,
+                                         (struct sockaddr *)&client_addr, &addr_len);
+        if (bytes_received < 0) {
+            log_message("Error receiving packet: %s", strerror(errno));
             continue;
         }
         
-        // Process packet based on opcode
-        uint16_t opcode = ntohs(*(uint16_t*)buffer);
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+        log_message("Received packet from %s:%d with opcode %d", 
+                   client_ip, ntohs(client_addr.sin_port), pkt.opcode);
         
-        if (opcode == OP_WRQ) {  // Write request
-            request_packet* req = (request_packet*)buffer;
-            printf("Received write request for file: %s\n", req->filename);
-            
-            // Create complete filepath in backup directory
-            create_backup_path(full_path, backup_dir, req->filename);
-            printf("Saving to: %s\n", full_path);
-            
-            // Open file for writing in backup directory
-            FILE* file = fopen(full_path, "wb");
-            if (!file) {
-                // Send error: cannot create file
-                send_error(server_socket, &client_addr, addr_len,
-                           ERR_ACCESS_DENIED, "Cannot create file");
-                continue;
-            }
-            
-            // Send initial ACK
-            ack_packet ack;
-            ack.opcode = htons(OP_ACK);
-            ack.block_number = htons(0);
-            sendto(server_socket, &ack, sizeof(ack), 0,
-                   (struct sockaddr*)&client_addr, addr_len);
-            
-            // Buffers for decryption
-            unsigned char decrypted_data[DATA_BLOCK_SIZE + AES_BLOCK_SIZE];
-            
-            // Receive data blocks
-            uint16_t expected_block = 1;
-            while (1) {
-                received_bytes = recvfrom(server_socket, buffer, sizeof(buffer), 0,
-                                (struct sockaddr*)&client_addr, &addr_len);
+        switch (pkt.opcode) {
+            case OP_READ_REQUEST:
+                handle_read_request(sockfd, &client_addr, addr_len, pkt.data);
+                break;
                 
-                if (received_bytes < 0) {
-                    perror("recvfrom failed");
-                    break;
-                }
+            case OP_WRITE_REQUEST:
+                handle_write_request(sockfd, &client_addr, addr_len, pkt.data);
+                break;
                 
-                // Check opcode
-                opcode = ntohs(*(uint16_t*)buffer);
+            case OP_DELETE_REQUEST:
+                handle_delete_request(sockfd, &client_addr, addr_len, pkt.data);
+                break;
                 
-                if (opcode == OP_DATA) {
-                    data_packet* data = (data_packet*)buffer;
-                    uint16_t block = ntohs(data->block_number);
-                    printf("Received block #%d\n", block);
-                    
-                    if (block == expected_block) {
-                        // Get encrypted data size and decrypt
-                        int encrypted_size = received_bytes - 4;  // Subtract header size
-                        int decrypted_size = decrypt_data((unsigned char*)data->data, encrypted_size, decrypted_data);
-
-                        // Write decrypted data to file
-                        size_t bytes_written = fwrite(decrypted_data, 1, decrypted_size, file);
-                        if (bytes_written != (size_t)decrypted_size) {
-                            perror("Error writing to file");
-                            send_error(server_socket, &client_addr, addr_len,
-                                      ERR_DISK_FULL, "Failed to write to file");
-                            fclose(file);
-                            remove(full_path);
-                            break;
-                        }
-                        
-                        // Make sure to flush the data to disk
-                        fflush(file);
-                        
-                        // Send ACK
-                        ack.opcode = htons(OP_ACK);
-                        ack.block_number = htons(block);
-                        sendto(server_socket, &ack, sizeof(ack), 0,
-                               (struct sockaddr*)&client_addr, addr_len);
-                        
-                        printf("Decrypted block #%d, size: %d\n", block, decrypted_size);
-                        expected_block++;
-                        
-                        // Check if this was the last block (encrypted size might be padded)
-                        if (encrypted_size < DATA_BLOCK_SIZE) {
-                            printf("Last data block received\n");
-                            // We'll wait for the verification packet
-                        }
-                    } else if (block > expected_block) {
-                        // Duplicate block, send ACK for expected block
-                        ack.opcode = htons(OP_ACK);
-                        ack.block_number = htons(expected_block - 1);
-                        sendto(server_socket, &ack, sizeof(ack), 0,
-                               (struct sockaddr*)&client_addr, addr_len);
-                        printf("Duplicate block received, sent ACK for block #%d\n", expected_block - 1);
-                    } else {
-                        // Out of order block, ignore it
-                        printf("Out of order block received, expected block #%d\n", expected_block);
-                    }
-                } else if (opcode == OP_VERIFY) {
-                    // Process verification packet
-                    verify_packet* verify = (verify_packet*)buffer;
-                    
-                    // Get the client's MD5 hash
-                    unsigned char client_md5[MD5_DIGEST_LENGTH];
-                    memcpy(client_md5, verify->md5_hash, MD5_DIGEST_LENGTH);
-                    
-                    printf("Received MD5 hash: ");
-                    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
-                        printf("%02x", client_md5[i]);
-                    }
-                    printf("\n");
-                    
-                    // Make sure file is flushed to disk before calculating MD5
-                    fflush(file);
-                    
-                    // Calculate our own MD5 hash of the downloaded file
-                    unsigned char calculated_md5[MD5_DIGEST_LENGTH];
-                    
-                    // Reopen the file to ensure all data is properly read
-                    // This forces any cached writes to be committed to disk
-                    fclose(file);
-                    file = fopen(full_path, "rb");
-                    if (!file) {
-                        send_error(server_socket, &client_addr, addr_len,
-                                  ERR_ACCESS_DENIED, "Cannot reopen file for verification");
-                        remove(full_path);
-                        printf("Error reopening file for verification\n");
-                        break;
-                    }
-                    
-                    calculate_md5(file, calculated_md5);
-                    
-                    printf("Calculated MD5 hash: ");
-                    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
-                        printf("%02x", calculated_md5[i]);
-                    }
-                    printf("\n");
-                    
-                    // Compare MD5 hashes
-                    int match = 1;
-                    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
-                        if (client_md5[i] != calculated_md5[i]) {
-                            match = 0;
-                            break;
-                        }
-                    }
-                    
-                    if (match) {
-                        printf("File integrity verified (MD5 hash matched)\n");
-                        // Send ACK for verification
-                        ack.opcode = htons(OP_ACK);
-                        ack.block_number = htons(0); // Special block for verification
-                        sendto(server_socket, &ack, sizeof(ack), 0,
-                               (struct sockaddr*)&client_addr, addr_len);
-                    } else {
-                        printf("File integrity verification FAILED!\n");
-                        // Send error
-                        send_error(server_socket, &client_addr, addr_len,
-                                  ERR_VERIFICATION, "MD5 hash mismatch - file corrupted");
-                        
-                        // Delete the corrupted file
-                        fclose(file);
-                        remove(full_path);
-                        printf("Corrupted file deleted\n");
-                        break;
-                    }
-                    
-                    // Close file - upload complete with verification
-                    fclose(file);
-                    printf("Upload complete and verified\n");
-                    break;
-                } else if (opcode == OP_ERROR) {
-                    error_packet *error = (error_packet*)buffer;
-                    printf("Error from client: %s\n", error->error_msg);
-                    fclose(file);
-                    break;
-                } else {
-                    printf("Unexpected packet type: %d\n", opcode);
-                    break;
-                }
-            }
-            
-        } else if (opcode == OP_RRQ) {  // Read request
-            request_packet* req = (request_packet*)buffer;
-            printf("Received read request for file: %s\n", req->filename);
-            
-            // Create complete filepath in backup directory
-            create_backup_path(full_path, backup_dir, req->filename);
-            printf("Reading from: %s\n", full_path);
-            
-            // Open file for reading from backup directory
-            FILE* file = fopen(full_path, "rb");
-            if (!file) {
-                // Send error: file not found
-                send_error(server_socket, &client_addr, addr_len,
-                          ERR_FILE_NOT_FOUND, "File not found");
-                continue;
-            }
-            
-            // Calculate MD5 hash for verification
-            unsigned char md5_digest[MD5_DIGEST_LENGTH];
-            calculate_md5(file, md5_digest);
-            
-            printf("File MD5: ");
-            for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
-                printf("%02x", md5_digest[i]);
-            }
-            printf("\n");
-            
-            // Buffers for encryption
-            unsigned char plaintext[DATA_BLOCK_SIZE];
-            // unsigned char ciphertext[DATA_BLOCK_SIZE + AES_BLOCK_SIZE]; // Allow for padding
-            
-            // Send file in blocks
-            uint16_t block_number = 1;
-            data_packet data;
-            int bytes_read;
-            
-            while (1) {
-                data.opcode = htons(OP_DATA);
-                data.block_number = htons(block_number);
-                
-                // Read original data
-                bytes_read = fread(plaintext, 1, DATA_BLOCK_SIZE, file);
-                if (bytes_read < 0) {
-                    perror("File read error");
-                    break;
-                }
-                
-                // Encrypt the data
-                int encrypted_size = encrypt_data(plaintext, bytes_read, (unsigned char*)data.data);
-                
-                // Send encrypted data packet
-                sendto(server_socket, &data, 4 + encrypted_size, 0,  // 4 bytes header + encrypted data
-                       (struct sockaddr*)&client_addr, addr_len);
-                       
-                printf("Sent block #%d, size: %d (encrypted: %d)\n", 
-                       block_number, bytes_read, encrypted_size);
-                
-                // Wait for ACK
-                received_bytes = recvfrom(server_socket, buffer, sizeof(buffer), 0,
-                                (struct sockaddr*)&client_addr, &addr_len);
-                                
-                if (received_bytes < 0) {
-                    perror("ACK receive error");
-                    break;
-                }
-                
-                ack_packet* ack = (ack_packet*)buffer;
-                if (ntohs(ack->opcode) != OP_ACK || ntohs(ack->block_number) != block_number) {
-                    printf("Invalid ACK\n");
-                    break;
-                }
-                
-                block_number++;
-                
-                // Check if this was the last block
-                if (bytes_read < DATA_BLOCK_SIZE) {
-                    // Send verification packet with MD5 hash
-                    verify_packet verify;
-                    verify.opcode = htons(OP_VERIFY);
-                    memcpy(verify.md5_hash, md5_digest, MD5_DIGEST_LENGTH);
-                    
-                    printf("Sending MD5 verification...\n");
-                    sendto(server_socket, &verify, sizeof(verify), 0,
-                           (struct sockaddr*)&client_addr, addr_len);
-                           
-                    // Wait for verification acknowledgment
-                    received_bytes = recvfrom(server_socket, buffer, sizeof(buffer), 0,
-                                    (struct sockaddr*)&client_addr, &addr_len);
-                                    
-                    if (received_bytes > 0) {
-                        opcode = ntohs(*(uint16_t*)buffer);
-                        if (opcode == OP_ACK) {
-                            printf("Client verified file integrity\n");
-                        } else if (opcode == OP_ERROR) {
-                            error_packet* error = (error_packet*)buffer;
-                            printf("Client reported verification error: %s\n", error->error_msg);
-                        }
-                    }
-                    
-                    printf("Download complete\n");
-                    break;
-                }
-            }
-            
-            fclose(file);
-        } else if (opcode == OP_DELETE) {
-            request_packet* req = (request_packet*)buffer;
-            printf("Received delete request for file: %s\n", req->filename);
-            
-            // Create complete filepath in backup directory
-            create_backup_path(full_path, backup_dir, req->filename);
-            
-            // Delete the file
-            if (remove(full_path) == 0) {
-                printf("File deleted successfully: %s\n", full_path);
-                
-                // Send acknowledgment
-                ack_packet ack;
-                ack.opcode = htons(OP_ACK);
-                ack.block_number = htons(0);  // Block 0 for delete ack
-                
-                sendto(server_socket, &ack, sizeof(ack), 0,
-                       (struct sockaddr*)&client_addr, addr_len);
-            } else {
-                printf("Error deleting file: %s\n", strerror(errno));
-                
-                // Send error response
-                send_error(server_socket, &client_addr, addr_len, 
-                          ERR_ACCESS_DENIED, "Could not delete file");
-            }
-        } else {
-            printf("Unknown opcode: %d\n", opcode);
-            
-            // Send error: unknown opcode
-            send_error(server_socket, &client_addr, addr_len, 
-                      ERR_NOT_DEFINED, "Unknown opcode");
+            default:
+                log_message("Received unknown opcode: %d", pkt.opcode);
+                break;
         }
     }
-    close(server_socket);
+    
+    close(sockfd);
+    if (log_file) fclose(log_file);
     return 0;
 }
