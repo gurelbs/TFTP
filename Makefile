@@ -13,4 +13,4 @@ client: client.c udp_file_transfer.h
 clean:
 	rm -f server client
 	rm -f *.log
-	rm -Rf backup
+	
